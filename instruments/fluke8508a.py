@@ -23,10 +23,9 @@ THE SOFTWARE.
 """
 
 import logging
-import time
 
 from pymeasure.instruments import Instrument
-from pymeasure.instruments.validators import truncated_range
+from pymeasure.instruments.validators import truncated_range, strict_discrete_set
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
@@ -125,13 +124,11 @@ class Fluke8508A(Instrument):
             includeSCPI=False,
             **kwargs,
         )
-        # Initialise configuration state.  These attributes track the
-        # currently selected measurement function, range token, autorange
-        # state, resolution, fast mode and filter mode.  They are used
-        # when constructing the configuration command in the :attr:`reading`
-        # property.  By storing them on the instance rather than the class
-        # we avoid shared state between multiple instrument instances.
-        self._function = None  # type: str | None
+        # Initialise configuration state. These attributes track the selected
+        # range token, autorange state, resolution, fast mode and filter mode.
+        # They are used when constructing the configuration command in the
+        # :attr:`reading` property. By storing them on the instance rather than
+        # the class we avoid shared state between multiple instrument instances.
         self._range_token = None  # type: str | None
         self._autorange = True  # type: bool
         self._resolution = None  # type: int | None
@@ -185,39 +182,25 @@ class Fluke8508A(Instrument):
     # parameters to be set individually.  Internally they are stored and
     # combined when a measurement is triggered via the :attr:`reading`
     # property.  The following attributes track the current configuration.
-    _function: str | None = None
     _range_token: str | None = None
     _autorange: bool = True
     _resolution: int | None = None
     _fast_enabled: bool = True
     _filter_enabled: bool = False
 
-    @property
-    def function_(self) -> str:
+    function_ = Instrument.control(
+        "FUNC?",
+        "FUNC '{:s}'",
         """Get or set the current measurement function.
 
-        The instrument supports DC voltage (``"DCV"``) and DC current
-        (``"DCI"``) natively; additional functions (AC voltage and AC current)
-        are defined here for future expansion.  Setting this property
-        immediately writes ``FUNC '<TOKEN>'`` to the instrument.
-
-        ``function_`` is mapped to the corresponding SCPI token via
-        :attr:`FUNCTIONS` with ``map_values=True``, so the user can provide
-        friendly names (e.g. ``"DCV"``) and the correct instrument token
-        (e.g. ``"VOLT:DC"``) will be sent.
-        """
-        return self._function
-
-    @function_.setter
-    def function_(self, value: str) -> None:
-        # Validate input
-        if value not in self.FUNCTIONS:
-            raise ValueError(f"Invalid function '{value}'. Valid options are: {list(self.FUNCTIONS.keys())}")
-        # Send the command only if the function has changed
-        if value != self._function:
-            scpi_token = self.FUNCTIONS[value]
-            self.write(f"FUNC '{scpi_token}'")
-            self._function = value
+        ``function_`` accepts keys defined in :attr:`FUNCTIONS` and writes the
+        corresponding SCPI token to the instrument.  The property queries the
+        instrument for the current function when read.
+        """,
+        validator=strict_discrete_set,
+        values=FUNCTIONS,
+        map_values=True,
+    )
 
     @property
     def autorange(self) -> bool:
@@ -385,25 +368,30 @@ class Fluke8508A(Instrument):
     # Measurement helpers
     # -------------------------------------------------------------------------
     def _wait_for_opc(self, timeout: float = 10.0) -> None:
-        """Wait until the instrument signals that the last operation completed.
+        """Block until the instrument completes the previous operation.
 
-        The Fluke 8508A supports the standard ``*OPC?`` query which returns
-        ``1`` when the operation is complete.  This helper polls the query
-        until completion or until the timeout is exceeded.
+        The ``*OPC?`` query does not return until all pending operations have
+        finished.  Issuing the query once with an extended timeout allows the
+        code to wait efficiently for long measurements without polling or
+        sleeping.
 
-        :param timeout: Maximum number of seconds to wait.
-        :raises TimeoutError: If the timeout elapses before completion.
+        :param timeout: Maximum number of seconds to wait for completion.
+        :raises TimeoutError: If the operation does not complete in time.
         """
-        start = time.time()
-        while True:
-            status = self.ask("*OPC?").strip()
-            if status == "1":
-                return
-            if (time.time() - start) > timeout:
-                raise TimeoutError(
-                    "Operation did not complete within the timeout period"
-                )
-            time.sleep(0.1)
+        connection = getattr(self.adapter, 'connection', None)
+        original_timeout = getattr(connection, 'timeout', None)
+        if connection is not None and original_timeout is not None:
+            connection.timeout = timeout * 1000  # PyVISA uses milliseconds
+        try:
+            # ``ask`` blocks until the instrument responds or times out
+            self.ask('*OPC?')
+        except Exception as exc:
+            raise TimeoutError(
+                'Operation did not complete within the timeout period',
+            ) from exc
+        finally:
+            if connection is not None and original_timeout is not None:
+                connection.timeout = original_timeout
 
     # -------------------------------------------------------------------------
     # DC Voltage Measurement
